@@ -6,10 +6,11 @@ function project()
     % Phase 1: Preprocessing
     [img, gt] = preprocess_data(imagePath, maskPath);
     
-    % Phase 2: Homomorphic Filter (Placeholder for now)
+    % Place to call each function 
     homo_filter_out = homomorphic_filter(img);
     contrast_out = contrast_enhancement(homo_filter_out);
     featureMap = generate_features(contrast_out);
+    binaryMask = segment_image(featureMap);
     
     % Display results to verify Phase 1 worked alter for other phases
     figure;
@@ -111,29 +112,51 @@ function featureMap = generate_features(contrast_out)
     Gx = [-1 0 1; -2 0 2; -1 0 1];
     Gy = [1 2 1; 0 0 0; -1 -2 -1];
     
-    gradX = imfilter(img, Gx, 'replicate');
-    gradY = imfilter(img, Gy, 'replicate');
+    gradX = imfilter(contrast_out, Gx, 'replicate');
+    gradY = imfilter(contrast_out, Gy, 'replicate');
     gradMag = sqrt(gradX.^2 + gradY.^2);
     % Normalize gradient
     gradMag = gradMag / max(gradMag(:));
     
-    % 2. Local Variance
+    % Local Variance
     % Measures texture heterogeneity. Window size 7x7 is good for US images.
     h = ones(7,7) / (7*7);
-    mu = imfilter(img, h, 'replicate');
-    mu2 = imfilter(img.^2, h, 'replicate');
+    mu = imfilter(contrast_out, h, 'replicate');
+    mu2 = imfilter(contrast_out.^2, h, 'replicate');
     localVar = mu2 - mu.^2; 
     % Normalize variance
     localVar = localVar / max(localVar(:));
     
-    % 3. Combined Feature Map
+    % Combined Feature Map
     % We want regions with high variance OR strong edges.
-    % We also invert the intensity: Tumors are dark, so (1 - img) makes them bright
-    intensityFeature = 1 - img;
+    % We also invert the intensity: Tumors are dark, so (1 - contrast_out) makes them bright
+    intensityFeature = 1 - contrast_out;
     
     featureMap = (0.4 * intensityFeature) + (0.3 * gradMag) + (0.3 * localVar);
     featureMap = (featureMap - min(featureMap(:))) / (max(featureMap(:)) - min(featureMap(:)));   
-
 end
+
+function binaryMask = segment_image(featureMap)
+    % Calculate the statistical properties of the entire map
+    % fMap(:) flattens the 2D matrix into a 1D list for statistics
+    avgVal = mean(featureMap(:));
+    stdVal = std(featureMap(:));
+    
+    % Determine the Adaptive Threshold
+    % Logic: If a pixel is 'k' standard deviations above the average, 
+    % it is likely part of a tumor (the bright regions of the feature map).
+    % Start with k = 1.0. Increase it if the mask is too 'noisy'.
+    k = 1.0; 
+    threshold = avgVal + (k * stdVal);
+    
+    % 3. Create the Binary Mask (Logical 0 or 1)
+    binaryMask = featureMap > threshold;
+    
+    % Visualizing for the user in the Command Window
+    fprintf('Phase 5: Threshold set at %.4f (Mean: %.4f, Std: %.4f)\n', ...
+            threshold, avgVal, stdVal);
+end
+
+
 
     
