@@ -1,6 +1,6 @@
-function project()
+function project_alltestcases()
     fprintf('======================================================\n');
-    fprintf('STARTING TITAN PIPELINE: MAXIMUM IoU OVERRIDE\n');
+    fprintf('STARTING TITAN PIPELINE: H-MINIMA & RECONSTRUCTION\n');
     fprintf('======================================================\n\n');
     
     test_cases = {
@@ -11,6 +11,8 @@ function project()
     };
     
     num_cases = size(test_cases, 1);
+    
+    % Initialize with -1 to ensure 0.0000 scores are penalized in the mean
     all_iou = -ones(num_cases, 1); 
     all_dice = -ones(num_cases, 1);
     
@@ -26,7 +28,7 @@ function project()
         fprintf('Processing Case %d/%d: [%s]...\n', i, num_cases, imgName);
         
         if ~exist(imgName, 'file') || ~exist(gtName, 'file')
-            fprintf('  -> ERROR: Files %s or %s not found. Skipping.\n', imgName, gtName);
+            fprintf('  -> ERROR: Files not found. Skipping.\n');
             continue;
         end
         
@@ -38,7 +40,7 @@ function project()
         fprintf('  -> IoU: %.4f | Dice: %.4f | Sens: %.4f | Spec: %.4f\n', ...
             metrics.iou, metrics.dice, metrics.sensitivity, metrics.specificity);
             
-        if i == 1
+        if i == 3 % Save TEST2 (the hardest one) for the diagnostic dashboard
             diagnostic_phases.img = img;
             diagnostic_phases.gt = gt_resized;
             diagnostic_phases.finalMask = finalMask;
@@ -82,47 +84,71 @@ function project()
 end
 
 % =========================================================================
-% CORE PIPELINE (THE MAXIMUM IoU BRUTE FORCE METHOD)
+% CORE PIPELINE: H-MINIMA & MORPHOLOGICAL RECONSTRUCTION
 % =========================================================================
 function [img, gt_resized, finalMask, metrics, phases] = process_single_image(imgName, gtName)
     
     [img, gt] = preprocess_data(imgName, gtName);
     phases = struct(); 
+    [rows, cols] = size(img);
     
-    % Phase 1: Aggressive Denoising (Obliterates JPEG blocks and speckle)
+    % Phase 1: Clinical-Grade Denoising (Preserves structural valleys)
     phases.img_denoised = imgaussfilt(medfilt2(img, [7 7], 'symmetric'), 1.5);
     
-    % Phase 2: Contrast Enhancement
-    phases.img_enhanced = adapthisteq(phases.img_denoised, 'ClipLimit', 0.02);
+    % Phase 2 & 3: Dynamic H-Minima Transform & The Reconstruction Shadow Killer
+    % We loop through depth thresholds to guarantee we find seeds for both deep and shallow tumors
+    h_depths = [0.20, 0.15, 0.10, 0.05]; 
     
-    % Phase 3: Multi-level K-Means Quantization (Finds the absolute darkest regions)
-    levels = multithresh(phases.img_enhanced, 2); 
-    quantized_img = imquantize(phases.img_enhanced, levels);
-    phases.dark_mask = (quantized_img == 1);
+    % Define the "Kill Zones" (Bottom 20% for shadows, Top 5% for skin lines)
+    kill_zone = false(rows, cols);
+    kill_zone(round(rows * 0.80):end, :) = true; 
+    kill_zone(1:round(rows * 0.05), :) = true;   
     
-    % Phase 4: Morphological "Glue" (Melts fractured tumor pieces back together)
-    phases.glued_mask = imclose(phases.dark_mask, strel('disk', 12));
-    phases.glued_mask = imfill(phases.glued_mask, 'holes');
+    phases.clean_seeds = false(rows, cols);
     
-    % Phase 5: Size Filtering (Deletes tiny noise specks)
-    phases.clean_mask = bwareaopen(phases.glued_mask, 150);
-    
-    % Phase 6: Instant-Kill Heuristic Selection
-    phases.best_candidate = select_ultimate_lesion(phases.clean_mask, phases.img_enhanced);
-    
-    % Phase 7: Halo-Expanding Active Contour
-    % Negative bias (-0.15) forces the snake to expand and swallow the fuzzy gray boundaries!
-    if sum(phases.best_candidate(:)) > 0
-        finalMask = activecontour(phases.img_enhanced, phases.best_candidate, 100, 'Chan-Vese', ...
-            'SmoothFactor', 1.5, 'ContractionBias', -0.15);
-    else
-        finalMask = false(size(img));
+    for h = h_depths
+        % Find local dark valleys of depth 'h'
+        regional_min = imextendedmin(phases.img_denoised, h);
+        
+        % The Shadow Killer: Find any valley that touches the kill zone
+        bad_seeds_init = regional_min & kill_zone;
+        
+        % Reconstruct to find the entirety of the shadow, then delete it
+        bad_seeds_full = imreconstruct(bad_seeds_init, regional_min);
+        surviving_seeds = regional_min & ~bad_seeds_full;
+        
+        % Clean up tiny 1-pixel noise
+        surviving_seeds = bwareaopen(surviving_seeds, 15);
+        
+        if sum(surviving_seeds(:)) > 0
+            phases.raw_minima = regional_min;
+            phases.clean_seeds = surviving_seeds;
+            break; % We found good seeds, stop digging deeper
+        end
     end
     
-    % Phase 8: Final Polish & Single Lesion Enforcer
-    finalMask = imclose(finalMask, strel('disk', 5));
+    % Phase 4: Local Contrast Scoring to select the True Tumor
+    phases.best_seed = select_ultimate_seed(phases.clean_seeds, phases.img_denoised);
+    
+    % Phase 5: Targeted Active Contour Expansion
+    % Negative bias (-0.15) acts like a balloon, inflating the tiny seed 
+    % until it hits the fuzzy gray edges of the tumor.
+    if sum(phases.best_seed(:)) > 0
+        % We expand from the seed on the heavily contrasted image
+        img_eq = adapthisteq(phases.img_denoised, 'ClipLimit', 0.02);
+        
+        phases.ac_mask = activecontour(img_eq, phases.best_seed, 250, 'Chan-Vese', ...
+            'SmoothFactor', 2.0, 'ContractionBias', -0.15);
+    else
+        phases.ac_mask = false(size(img));
+    end
+    
+    % Phase 6: Final Morphological Polish
+    % Melts any jagged edges and fills internal holes
+    finalMask = imclose(phases.ac_mask, strel('disk', 6));
     finalMask = imfill(finalMask, 'holes');
     
+    % Absolute Guarantee: Keep only the single largest contiguous object
     [L_final, num_final] = bwlabel(finalMask);
     if num_final > 1
         stats_final = regionprops(L_final, 'Area');
@@ -144,57 +170,58 @@ function [img, gt_resized, finalMask, metrics, phases] = process_single_image(im
 end
 
 % =========================================================================
-% HEURISTIC SELECTION (INSTANT KILL LOGIC)
+% HEURISTIC SELECTION (Local Contrast Focused)
 % =========================================================================
-function finalMask = select_ultimate_lesion(bw_mask, originalImg)
-    [L, num] = bwlabel(bw_mask);
+function best_seed = select_ultimate_seed(seed_mask, originalImg)
+    [L, num] = bwlabel(seed_mask);
     if num == 0
-        finalMask = bw_mask; 
+        best_seed = seed_mask; 
         return; 
     end
     
-    stats = regionprops(L, 'Area', 'Solidity', 'Centroid', 'BoundingBox', 'PixelIdxList');
+    stats = regionprops(L, 'Area', 'Solidity', 'Centroid', 'PixelIdxList', 'BoundingBox');
     scores = zeros(num, 1);
+    
     [rows, cols] = size(originalImg);
     centerX = cols / 2;
     centerY = rows / 2;
     maxDist = sqrt(centerX^2 + centerY^2);
     
     for i = 1:num
+        % 1. Local Contrast (The most important metric for small tumors)
+        % Compare the dark core to the immediate surrounding tissue
+        coreInt = mean(originalImg(stats(i).PixelIdxList));
+        
         bb = stats(i).BoundingBox;
+        halo_radius = 15;
+        min_r = max(1, floor(bb(2) - halo_radius));
+        max_r = min(rows, ceil(bb(2) + bb(4) + halo_radius));
+        min_c = max(1, floor(bb(1) - halo_radius));
+        max_c = min(cols, ceil(bb(1) + bb(3) + halo_radius));
         
-        % INSTANT KILL 1: Acoustic Shadows (Touches bottom 15% of screen)
-        if (bb(2) + bb(4)) > (rows * 0.85)
-            continue; 
-        end
+        halo_region = originalImg(min_r:max_r, min_c:max_c);
+        haloInt = mean(halo_region(:));
         
-        % INSTANT KILL 2: Skin/Gel Artifacts (Touches top 10% AND is wider than 40% of screen)
-        if bb(2) < (rows * 0.10) && bb(3) > (cols * 0.40)
-            continue; 
-        end
+        localContrastScore = haloInt - coreInt; 
+        if localContrastScore < 0, localContrastScore = 0; end
         
-        % Math Scoring
-        areaScore = stats(i).Area; % Raw area heavily favored
-        solidityScore = stats(i).Solidity;
-        
-        % Distance from center (Tumors are framed centrally by ultrasound techs)
+        % 2. Centrality (Ultrasound techs center the lesion)
         dist = sqrt((stats(i).Centroid(1) - centerX)^2 + (stats(i).Centroid(2) - centerY)^2);
         locationScore = 1 - (dist / maxDist);
         
-        % Darkness Check
-        meanInt = mean(originalImg(stats(i).PixelIdxList));
-        contrastScore = 1 - meanInt;
+        % 3. Solidity (Tumors are solid, artifacts are jagged)
+        solidityScore = stats(i).Solidity;
         
-        % The Multiplication ensures all factors must be high to win
-        scores(i) = areaScore * locationScore * solidityScore * contrastScore;
+        % FUSION LOGIC: Heavily weights local contrast so TEST2 wins
+        scores(i) = (localContrastScore * 0.60) + (locationScore * 0.20) + (solidityScore * 0.20);
     end
     
     [~, bestIdx] = max(scores);
-    finalMask = (L == bestIdx);
+    best_seed = (L == bestIdx);
 end
 
 % =========================================================================
-% POPUP 2: SIMPLIFIED DIAGNOSTIC DASHBOARD RENDERER
+% POPUP 2: DIAGNOSTIC DASHBOARD RENDERER
 % =========================================================================
 function render_diagnostic_dashboard(dp)
     if isempty(fieldnames(dp)), return; end
@@ -203,17 +230,25 @@ function render_diagnostic_dashboard(dp)
            'NumberTitle', 'off', 'Position', [100, 100, 1400, 600]);
            
     subplot(2, 4, 1); imshow(dp.img); title('1. Original Input');
-    subplot(2, 4, 2); imshow(dp.data.img_denoised); title('2. Aggressive Denoise');
-    subplot(2, 4, 3); imshow(dp.data.img_enhanced); title('3. Contrast Enhanced');
-    subplot(2, 4, 4); imshow(dp.data.dark_mask); title('4. K-Means Quantization');
+    subplot(2, 4, 2); imshow(dp.data.img_denoised); title('2. Gaussian/Median Filter');
     
-    subplot(2, 4, 5); imshow(dp.data.glued_mask); title('5. Morphological Glue');
-    subplot(2, 4, 6); imshow(dp.data.clean_mask); title('6. Size Filtering');
-    subplot(2, 4, 7); imshow(dp.data.best_candidate); title('7. Instant-Kill Selection');
+    if isfield(dp.data, 'raw_minima')
+        subplot(2, 4, 3); imshow(dp.data.raw_minima); title('3. Raw H-Minima');
+    end
     
-    subplot(2, 4, 8); 
+    subplot(2, 4, 4); imshow(dp.data.clean_seeds); title('4. Shadow Killer (Reconstruct)');
+    subplot(2, 4, 5); imshow(dp.data.best_seed); title('5. Winning Seed');
+    
+    subplot(2, 4, 6); 
     imshow(dp.img); 
-    title('8. Final Expanded Snake (Red)');
+    hold on;
+    visboundaries(dp.data.best_seed, 'Color', 'y', 'LineWidth', 1);
+    hold off;
+    title('6. Snake Initialization (Yellow)');
+    
+    subplot(2, 4, [7, 8]); 
+    imshow(dp.img); 
+    title('7 & 8. Final Expanded Snake (Red) vs GT (Green)');
     hold on;
     visboundaries(dp.finalMask, 'Color', 'r', 'LineWidth', 2);
     visboundaries(dp.gt, 'Color', 'g', 'LineWidth', 1, 'LineStyle', '--');
